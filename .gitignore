@@ -6,6 +6,8 @@ data/
 *.wav
 report.html
 report*.html
+transcript.html
+accuracy.html
 install.log
 pytest-cache-files-*
 .uv/

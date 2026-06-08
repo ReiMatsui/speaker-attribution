@@ -38,6 +38,10 @@ uv run python scripts/demo_synth.py --real a.wav b.wav --use-embedding
 # 実験の中身を「聴いて・見て」確認するHTMLレポートを生成
 uv run python scripts/visualize.py            # report.html を生成 → ブラウザで開く
 uv run python scripts/visualize.py --leak-db -6 --overlap-s 4   # 難しい条件
+
+# 話者ラベル付き文字起こし(最終ゴールの形)
+uv run python scripts/transcribe.py --model tiny     # 漏れ込みを除いて who-said-what
+uv run python scripts/transcribe.py --model tiny --no-gate   # ゲートなしと比較
 ```
 
 > 注: `samples/` には別話者の公開音声(VOiCES / LibriSpeech / Silero)を
