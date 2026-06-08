@@ -17,3 +17,6 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+
+leak_sweep.html
+single_vs_multi.html
