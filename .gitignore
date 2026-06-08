@@ -9,6 +9,7 @@ report*.html
 transcript.html
 accuracy.html
 accuracy_librispeech.html
+separation.html
 install.log
 pytest-cache-files-*
 .uv/

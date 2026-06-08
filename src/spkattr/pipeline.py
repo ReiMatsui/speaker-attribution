@@ -28,7 +28,7 @@ class Segment:
 def run(channels: np.ndarray, sr: int, owner_names: list[str],
         enroll: Enrollment | None = None,
         win_ms: float = 500.0, hop_ms: float = 250.0,
-        verify_thresh: float = 0.45, active_ratio: float = 0.2) -> list[Segment]:
+        verify_thresh: float = 0.30, active_ratio: float = 0.05) -> list[Segment]:
     """パイプライン本体.
 
     手順(各時間窓ごと):
