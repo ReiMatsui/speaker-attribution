@@ -1,0 +1,15 @@
+.venv/
+.venv-linux/
+__pycache__/
+*.pyc
+data/
+*.wav
+report.html
+report*.html
+install.log
+pytest-cache-files-*
+.uv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/

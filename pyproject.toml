@@ -1,0 +1,43 @@
+[project]
+name = "speaker-attribution"
+version = "0.1.0"
+description = "1人1マイク環境で、漏れ込み(クロストーク)を除去し各発話を持ち主に正しく帰属させる研究プロジェクト"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "resemblyzer>=0.1.4",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+spkattr-synth = "spkattr.cli:make_synth"
+spkattr-run = "spkattr.cli:run_pipeline"
+
+[tool.uv]
+# CPU版torchを使う(CUDAの巨大wheelを避ける)
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spkattr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
