@@ -68,17 +68,20 @@ def resolve_owner(window_per_ch: np.ndarray, sr: int,
     owner = int(np.argmax(energy))
     is_leak = np.zeros(n_ch, dtype=bool)
 
-    ref = window_per_ch[owner]
-    for ch in range(n_ch):
-        if ch == owner:
-            continue
-        tau, peak = gcc_phat(ref, window_per_ch[ch], sr, max_tau=max_tau)
-        # 同一音源(相関が高い)で、持ち主refより遅れている => 漏れ込み
-        if peak > corr_thresh and tau <= 0:
-            is_leak[ch] = True
-        elif peak > corr_thresh and tau > 0:
-            # ref の方が遅れている => 本来の持ち主は ch かもしれない
-            # よりエネルギーが近ければ持ち主を ch に譲る余地を残す
-            is_leak[ch] = False
+    # 全チャンネル対で判定する。
+    # チャンネル k が「他のあるチャンネル j の、遅れて小さくなったコピー」なら漏れ込み。
+    # （同時に複数人が話しても、各漏れは自分の発生源チャンネルに対して遅れる）
+    # 条件: corr(k,j) が高く、k が j に対して遅れており(tau>0)、j の方が大きい。
+    for k in range(n_ch):
+        for j in range(n_ch):
+            if j == k:
+                continue
+            if energy[j] <= energy[k]:
+                continue  # 発生源は自分のマイクで最も大きいはず
+            tau, peak = gcc_phat(window_per_ch[k], window_per_ch[j], sr, max_tau=max_tau)
+            # gcc_phat(k, j): tau>0 は k が j より遅れて到達 = k は j のコピー = 漏れ込み
+            if peak > corr_thresh and tau > 0:
+                is_leak[k] = True
+                break
 
     return {"owner": owner, "is_leak": is_leak, "energy_db": energy_db}
