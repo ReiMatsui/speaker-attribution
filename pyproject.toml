@@ -12,6 +12,7 @@ dependencies = [
     "resemblyzer>=0.1.4",
     "torch>=2.0",
     "openai-whisper>=20231117",
+    "parakeet-mlx>=0.5.2",
 ]
 
 [project.optional-dependencies]
