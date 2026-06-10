@@ -90,24 +90,46 @@ class VoiceProfiles:
 
     ANON = re.compile(r"^人物\d+$")
 
-    def __init__(self, path: str = "voices.json", thresh: float = 0.75, min_sec: float = 1.0,
-                 margin: float = 0.05, auto: bool = True, consist: float = 0.62,
-                 dedupe: float = 0.70):
-        from resemblyzer import VoiceEncoder, preprocess_wav  # 初回ロード数秒
-        self._pre = preprocess_wav
-        self._enc = VoiceEncoder("cpu", verbose=False)
+    # モデル別の既定しきい値（実音声プールで校正済み。スコアのスケールが違う）
+    # resemblyzer: 軽量・依存少。同一/別人の分布に重なりあり
+    # ecapa: 純粋な聞き分けはほぼ完全分離＋10倍速。ただし混合音声を成分話者と
+    #        強くマッチさせる癖があり、重なりの多い会議では要実地比較(2026-06-11検証)
+    DEFAULTS = {"resemblyzer": (0.75, 0.70, 0.62), "ecapa": (0.35, 0.28, 0.30)}
+
+    def __init__(self, path: str = "voices.json", thresh: float | None = None,
+                 min_sec: float = 1.0, margin: float = 0.05, auto: bool = True,
+                 consist: float | None = None, dedupe: float | None = None,
+                 model: str = "resemblyzer"):
+        self.model = model
+        if model == "ecapa":
+            import torch
+            from speechbrain.inference.speaker import EncoderClassifier
+            enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb")
+
+            def _embed_raw(wav):
+                with torch.no_grad():
+                    return enc.encode_batch(torch.from_numpy(wav).float().unsqueeze(0)).squeeze().numpy()
+            self._embed_raw = _embed_raw
+        else:
+            from resemblyzer import VoiceEncoder, preprocess_wav  # 初回ロード数秒
+            enc = VoiceEncoder("cpu", verbose=False)
+            self._embed_raw = lambda wav: enc.embed_utterance(preprocess_wav(wav, source_sr=SR))
+        d_th, d_dd, d_cs = self.DEFAULTS[model]
         self.path = path
-        self.thresh = thresh   # 即時判定: 単発声紋がこれ以上強く一致した時だけその場で人物確定
+        self.thresh = thresh if thresh is not None else d_th   # 即時判定のしきい値
         self.margin = margin   # 即時判定の追加条件: 2位との差（似た声の誤マッチ防止）
         self.auto = auto       # 未知の声の自動登録（匿名「人物N」プロファイル）
-        self.consist = consist  # バッファ確定条件: 3発話の全ペア類似がこれ以上
-        self.dedupe = dedupe    # 3発話プロファイルが既存人物に合流するしきい値
+        self.consist = consist if consist is not None else d_cs  # 3発話の全ペア類似の下限
+        self.dedupe = dedupe if dedupe is not None else d_dd     # 既存人物への合流しきい値
         self.min_sec = min_sec
         self.profiles: dict[str, np.ndarray] = {}
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
-                self.profiles = {k: np.asarray(v, dtype=np.float64)
-                                 for k, v in json.load(f).items()}
+                data = json.load(f)
+            if data.pop("_model", "resemblyzer") == model:   # 別モデルの声紋は互換性なし
+                self.profiles = {k: np.asarray(v, dtype=np.float64) for k, v in data.items()}
+            else:
+                print(f"# 注意: {path} は別の声紋モデルで作成されたため読み込みません", flush=True)
         self.sp_map: dict[str, str] = {}                    # Sonioxラベル -> 表示キー
         self.label_embs: dict[str, list[np.ndarray]] = {}   # ラベル -> 直近声紋（手動登録・校正用）
         self.buf: dict[str, list[np.ndarray]] = {}          # ラベル -> 即時判定できなかった声紋
@@ -147,13 +169,13 @@ class VoiceProfiles:
     def _embed(self, wav: np.ndarray) -> np.ndarray | None:
         t0 = time.perf_counter()
         try:
-            w = self._pre(wav, source_sr=SR)
-            if w.size < SR * 0.6:
+            emb = self._embed_raw(wav)
+            if emb is None or np.asarray(emb).ndim != 1:
                 return None
-            emb = self._enc.embed_utterance(w)
         except Exception:
             return None
         self.embed_ms.append((time.perf_counter() - t0) * 1000)
+        emb = np.asarray(emb, dtype=np.float64)
         return emb / np.linalg.norm(emb)
 
     def classify(self, wav: np.ndarray, sp, overlapped: bool = False) -> str:
@@ -273,6 +295,7 @@ class VoiceProfiles:
 
     def _persist(self):
         named = {k: v.tolist() for k, v in self.profiles.items() if not self.ANON.match(k)}
+        named["_model"] = self.model   # 声紋はモデル間で互換性がないため記録
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(named, f, ensure_ascii=False)
@@ -306,8 +329,11 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="ブラウザを自動で開かない")
     ap.add_argument("--no-vp", action="store_true", help="声紋照合を無効化（Sonioxのラベルをそのまま使う）")
     ap.add_argument("--voices", default="voices.json", help="声紋プロファイルの保存先(既定 voices.json)")
-    ap.add_argument("--vp-match", type=float, default=0.75,
-                    help="即時判定のしきい値。別人が同一人物にされる→上げる/判定が遅い→下げる(既定0.75)")
+    ap.add_argument("--vp-model", default="ecapa", choices=["ecapa", "resemblyzer"],
+                    help="声紋モデル(既定ecapa=聞き分けが強い。要 uv add speechbrain torchaudio。"
+                         "未導入なら自動でresemblyzerにフォールバック)")
+    ap.add_argument("--vp-match", type=float, default=None,
+                    help="即時判定のしきい値。省略時はモデル別の既定値(resemblyzer 0.75 / ecapa 0.35)")
     ap.add_argument("--vp-no-auto", action="store_true",
                     help="未知の声の自動登録（匿名「人物N」）を無効化")
     ap.add_argument("--vp-debug", action="store_true", help="発話ごとの声紋判定の内訳を表示")
@@ -349,17 +375,26 @@ def main():
 
     tracker: VoiceProfiles | None = None
     if not args.no_vp:
-        try:
-            print("# 声紋モデルを読み込み中…", flush=True)
-            tracker = VoiceProfiles(path=args.voices, thresh=args.vp_match,
-                                    auto=not args.vp_no_auto)
-            if tracker.profiles:
-                print(f"# 声紋プロファイル: {', '.join(tracker.profiles)}（{args.voices}）", flush=True)
-            else:
-                print(f"# 声紋プロファイル: なし。未知の声は「人物N」として自動追跡、"
-                      f"「1=松井」で実名化すると次回から自動表示（{args.voices}）", flush=True)
-        except ImportError:
-            print("# 声紋照合: OFF（uv add resemblyzer で有効化できます）", flush=True)
+        print("# 声紋モデルを読み込み中…", flush=True)
+        for model in dict.fromkeys([args.vp_model, "resemblyzer"]):   # 指定→ダメならフォールバック
+            try:
+                tracker = VoiceProfiles(path=args.voices, thresh=args.vp_match,
+                                        auto=not args.vp_no_auto, model=model)
+                if model != args.vp_model:
+                    print(f"# 注意: {args.vp_model} の依存が未導入のため {model} で動作します"
+                          f"（uv add speechbrain torchaudio で有効化）", flush=True)
+                print(f"# 声紋モデル: {model}", flush=True)
+                break
+            except ImportError:
+                continue
+        if tracker is None:
+            print("# 警告: 声紋照合がOFFです！ 依存が未導入のため人物の確定・補正は行われません。", flush=True)
+            print("#   有効化するには: uv add speechbrain torchaudio  →  再起動", flush=True)
+        elif tracker.profiles:
+            print(f"# 声紋プロファイル: {', '.join(tracker.profiles)}（{args.voices}）", flush=True)
+        else:
+            print(f"# 声紋プロファイル: なし。未知の声は「人物N」として自動追跡、"
+                  f"「1=松井」で実名化すると次回から自動表示（{args.voices}）", flush=True)
 
     pcm_buf = bytearray()               # 送信済み音声の全バッファ（声紋切り出し用, 16bit）
     buf_lock = threading.Lock()

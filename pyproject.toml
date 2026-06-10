@@ -17,6 +17,8 @@ dependencies = [
     "mlx-whisper>=0.4.3",
     "aiohttp>=3.14.1",
     "websockets>=16.0",
+    "speechbrain>=1.1.0",
+    "torchaudio>=2.11.0",
 ]
 
 [project.optional-dependencies]
