@@ -13,6 +13,10 @@ dependencies = [
     "torch>=2.0",
     "openai-whisper>=20231117",
     "parakeet-mlx>=0.5.2",
+    "sounddevice>=0.5.5",
+    "mlx-whisper>=0.4.3",
+    "aiohttp>=3.14.1",
+    "websockets>=16.0",
 ]
 
 [project.optional-dependencies]

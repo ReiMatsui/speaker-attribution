@@ -45,12 +45,17 @@ def gate_channels(channels, names):
     return out
 
 
-def asr_sentences(audio, engine, model_obj):
+def asr_sentences(audio, engine, model_obj, lang="ja"):
     if engine == "parakeet":
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             sf.write(tf.name, audio, SR); path = tf.name
         res = model_obj.transcribe(path); os.unlink(path)
         return [(s.start, s.end, s.text.strip()) for s in res.sentences if s.text.strip()]
+    elif engine == "mlx-whisper":
+        import mlx_whisper
+        r = mlx_whisper.transcribe(audio, path_or_hf_repo=model_obj, language=lang,
+                                   condition_on_previous_text=False)
+        return [(s["start"], s["end"], s["text"].strip()) for s in r.get("segments", []) if s["text"].strip()]
     else:
         from spkattr.asr import transcribe_words
         words = transcribe_words(model_obj, audio, SR)
@@ -68,7 +73,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
     ap.add_argument("--names", default=None)
-    ap.add_argument("--engine", choices=["parakeet", "whisper"], default="parakeet")
+    ap.add_argument("--engine", choices=["mlx-whisper", "parakeet", "whisper"], default="mlx-whisper",
+                    help="日本語は mlx-whisper か whisper。parakeetは英語/欧州語のみ")
+    ap.add_argument("--lang", default="ja", help="言語コード（ja=日本語, en=英語）")
+    ap.add_argument("--mlx-model", default="mlx-community/whisper-large-v3-turbo")
     ap.add_argument("--chunk-s", type=float, default=5.0, help="数秒ごとに処理（遅延の主因）")
     ap.add_argument("--context-s", type=float, default=1.5, help="境界で語を切らないための前文脈")
     ap.add_argument("--no-gate", dest="gate", action="store_false")
@@ -87,9 +95,11 @@ def main():
     if args.engine == "parakeet":
         from parakeet_mlx import from_pretrained
         model = from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")
+    elif args.engine == "mlx-whisper":
+        model = args.mlx_model
     else:
         from spkattr.asr import Transcriber
-        model = Transcriber("base")
+        model = Transcriber("base", language=args.lang)
 
     if args.gate:
         channels = gate_channels(channels, names)
@@ -105,7 +115,7 @@ def main():
             seg = channels[ch][int(a * SR):int(b * SR)]
             if np.abs(seg).max() < 1e-4:
                 continue
-            for s, e, text in asr_sentences(seg, args.engine, model):
+            for s, e, text in asr_sentences(seg, args.engine, model, args.lang):
                 abs_s = a + s
                 if abs_s < t - 0.05:       # 文脈領域の再掲はスキップ
                     continue

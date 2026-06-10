@@ -29,3 +29,6 @@ ami_h*.wav
 meeting_transcript.html
 ofshelf/ami_raw/
 ofshelf/ami_gated/
+
+transcripts/
+archive/offshelf/_cert/

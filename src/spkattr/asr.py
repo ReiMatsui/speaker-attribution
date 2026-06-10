@@ -45,16 +45,17 @@ def merge_own_spans(segments, n_ch, owner_names, max_gap_s=0.6):
 class Transcriber:
     """Whisper をラップしたASR."""
 
-    def __init__(self, model_name: str = "base", device: str = "cpu"):
+    def __init__(self, model_name: str = "base", device: str = "cpu", language: str = "en"):
         import whisper
         self.model = whisper.load_model(model_name, device=device)
+        self.language = language
 
     def transcribe_span(self, audio: np.ndarray, sr: int, robust: bool = True) -> str:
         # Whisper は 16kHz float32 を想定
         a = audio.astype(np.float32)
         if np.abs(a).max() > 0:
             a = a / np.abs(a).max() * 0.95
-        opts = dict(fp16=False, language="en")
+        opts = dict(fp16=False, language=self.language)
         if robust:
             # ハルシネーション・繰り返し・漏れ込み拾いを抑える設定
             opts.update(
@@ -75,7 +76,7 @@ def transcribe_words(transcriber, audio: np.ndarray, sr: int, robust: bool = Tru
     a = audio.astype(np.float32)
     if np.abs(a).max() > 0:
         a = a / np.abs(a).max() * 0.95
-    opts = dict(fp16=False, language="en", word_timestamps=True)
+    opts = dict(fp16=False, language=getattr(transcriber, "language", "en"), word_timestamps=True)
     if robust:
         opts.update(condition_on_previous_text=False, no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4, temperature=0.0)
