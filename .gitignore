@@ -16,3 +16,4 @@ samples/
 *.log
 
 transcripts/
+voices.json
