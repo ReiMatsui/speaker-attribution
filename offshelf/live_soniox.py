@@ -78,17 +78,14 @@ def fmt_ts(ms: int | None) -> str:
 
 
 class VoiceProfiles:
-    """登録済み声紋プロファイルとの照合で話者名を決める（台帳固定・誤り非伝播）.
+    """凍結プロファイル照合による話者特定（台帳固定・誤り非伝播）.
 
-    設計方針: 「台帳をその場で学習する」オンラインクラスタリングは、台帳自体が
-    間違えるため補正ルール（自動統合・脱出・汚染防止…）が増殖した。本方式は
-    台帳=プロファイルを固定し、各発話を独立に判定する。
-
-    - 発話(min_sec以上) → 声紋 → 登録者の中で一番似ている人（floor未満なら未知）
-    - 短い相槌 → そのSonioxラベルの直近の判定に追従
-    - 未登録の声 → "#<Sonioxラベル>" キー（話者1/2…と表示）
-    - enroll() でラベルの直近声紋をプロファイル登録・voices.jsonに永続化
-      → 次回の会議からは発話だけで自動的に実名表示
+    判定は2経路だけ:
+      ① 即時判定 — 単発声紋が強一致(thresh＋2位とmargin差)した時だけ、その場で人物確定
+      ② それ以外は3発話バッファ — 一貫した3発話を束ね「既存人物に合流(dedupe) or 新規人物N」
+    しきい値はセッション自動校正(部屋のラベル内/ラベル間類似の中間、厳しくする方向のみ)。
+    不変条件: 確定済みの人物キーは書き換えない（遡及置換は #ラベル→人物 の昇格のみ）。
+    実名(enroll)のみ voices.json に永続化、匿名「人物N」はセッション限り。
     """
 
     ANON = re.compile(r"^人物\d+$")
@@ -112,16 +109,40 @@ class VoiceProfiles:
                 self.profiles = {k: np.asarray(v, dtype=np.float64)
                                  for k, v in json.load(f).items()}
         self.sp_map: dict[str, str] = {}                    # Sonioxラベル -> 表示キー
-        self.label_embs: dict[str, list[np.ndarray]] = {}   # ラベル -> 直近声紋（手動登録用）
+        self.label_embs: dict[str, list[np.ndarray]] = {}   # ラベル -> 直近声紋（手動登録・校正用）
         self.buf: dict[str, list[np.ndarray]] = {}          # ラベル -> 即時判定できなかった声紋
         self.n_anon = 0
+        # セッション自動校正: この部屋での「同一人物らしさ」(ラベル内類似)と「別人らしさ」
+        # (ラベル間類似)を実測し、しきい値をその中間に置く。同室同マイクでは声紋類似が
+        # 全体に上振れして固定しきい値が破綻するため。校正は厳しくする方向にのみ働く(max)。
+        self.same_sims: list[float] = []
+        self.diff_sims: list[float] = []
         self.embed_ms: list[float] = []                     # レイテンシ統計
         self.counts: dict[str, int] = {}                    # 判定種別の集計
         self.last: dict | None = None                       # 直近の判定内容（可視化用）
+        self._lock = threading.RLock()   # classify(受信スレッド)とenroll/remap(入力スレッド)の排他
 
     def _note(self, kind: str, **info) -> None:
         self.counts[kind] = self.counts.get(kind, 0) + 1
         self.last = {"kind": kind, **info}
+
+    def _update_room_stats(self, sp: str, emb: np.ndarray) -> None:
+        for l2, es in self.label_embs.items():
+            tgt = self.same_sims if l2 == sp else self.diff_sims
+            tgt.extend(float(np.dot(emb, e2)) for e2 in es[-3:])
+        del self.same_sims[:-60]
+        del self.diff_sims[:-120]
+
+    def _calibrated(self) -> tuple[float, float, float]:
+        """(即時判定th, 合流dedupe, 一貫性consist)。校正は max(既定値, 実測中間点)."""
+        if len(self.same_sims) >= 8 and len(self.diff_sims) >= 12:
+            om = float(np.median(self.same_sims))
+            cm = float(np.median(self.diff_sims))
+            if om - cm > 0.05:   # 分離が確認できた時だけ校正
+                mid = (om + cm) / 2
+                return (max(self.thresh, mid + 0.4 * (om - mid)),
+                        max(self.dedupe, mid), max(self.consist, mid))
+        return self.thresh, self.dedupe, self.consist
 
     def _embed(self, wav: np.ndarray) -> np.ndarray | None:
         t0 = time.perf_counter()
@@ -136,17 +157,15 @@ class VoiceProfiles:
         return emb / np.linalg.norm(emb)
 
     def classify(self, wav: np.ndarray, sp, overlapped: bool = False) -> str:
-        """overlapped: この発話が他の発話と時間的に重なっていたか.
+        """発話を人物キーに割り当てる（経路はクラスdocstring参照）.
 
-        重なった発話は声が混ざっていて声紋がデタラメになるため、声での判定を
-        スキップして直前の対応を維持する（誤マッチで対応表を汚さない）。
+        overlapped=True の発話は声が混ざっていて声紋がデタラメになるため、
+        声での判定をスキップして直前の対応を維持する。
         """
-        """判定は2経路だけ:
-        ① 即時判定 — 単発声紋が強く一致(thresh以上＋2位とmargin差)した時だけ、その場で人物確定。
-        ② それ以外（弱い一致・未知・僅差）は区別せず3発話バッファへ — 一貫した3発話を束ねた
-           プロファイルで「既存人物に合流(dedupe以上) or 新規人物N」を確定。
-        不変条件: 過去に確定した人物キーは書き換えない。遡及置換は「#ラベル → 人物」の昇格のみ。
-        """
+        with self._lock:
+            return self._classify(wav, sp, overlapped)
+
+    def _classify(self, wav: np.ndarray, sp, overlapped: bool) -> str:
         sp = str(sp)
         prev = self.sp_map.get(sp)
         kind, info = "相槌追従", {}
@@ -157,32 +176,35 @@ class VoiceProfiles:
             if emb is None:
                 kind = "声紋計算不可"
             else:
+                self._update_room_stats(sp, emb)   # 部屋の同一/別人分布を実測(校正用)
                 self.label_embs.setdefault(sp, []).append(emb)
-                del self.label_embs[sp][:-10]    # 手動登録用に直近10発話だけ保持
+                del self.label_embs[sp][:-10]    # 手動登録・校正用に直近10発話だけ保持
+                th, dd, cs = self._calibrated()
                 if self.profiles:
                     ranked = sorted(((float(np.dot(p, emb)), n)
                                      for n, p in self.profiles.items()), reverse=True)
                     sim, cand = ranked[0]
                     second = ranked[1][0] if len(ranked) > 1 else -1.0
                     info = {"sim": sim, "name": cand, "prev": prev}
-                    if sim >= self.thresh and sim - second >= self.margin:
+                    if sim >= th and sim - second >= self.margin:
+                        # 注: ここでbufは消さない。たまたま強一致した発話でバッファを
+                        # リセットすると、新しい話者の3発話が永遠に貯まらない(検証で確認)。
                         self.sp_map[sp] = cand
-                        self.buf.pop(sp, None)
                         self._note("補正" if (prev is not None and not prev.startswith("#")
                                               and prev != cand) else "声紋一致", label=sp, **info)
                         return cand
-                kind = "蓄積中"
+                kind = "蓄積中" if self.auto else "未確定"
                 if self.auto:
                     b = self.buf.setdefault(sp, [])
                     b.append(emb)
                     del b[:-3]
-                    if len(b) == 3 and all(float(np.dot(b[i], b[j])) >= self.consist
+                    if len(b) == 3 and all(float(np.dot(b[i], b[j])) >= cs
                                            for i, j in itertools.combinations(range(3), 2)):
                         prof = np.mean(b, axis=0)
                         prof = prof / np.linalg.norm(prof)
                         hit_sim, hit = max(((float(np.dot(p, prof)), n)
                                             for n, p in self.profiles.items()), default=(-1.0, None))
-                        if hit is not None and hit_sim >= self.dedupe:
+                        if hit is not None and hit_sim >= dd:
                             target = hit          # 既存人物の別ラベルだった → 合流
                         else:
                             self.n_anon += 1
@@ -207,7 +229,10 @@ class VoiceProfiles:
         そのセッション限り）。戻り値: 旧表示キー（過去のrecords付け替え用）。
         十分な音声がまだ無ければ None。
         """
-        label = str(label)
+        with self._lock:
+            return self._enroll(str(label), name)
+
+    def _enroll(self, label: str, name: str) -> str | None:
         if label in self.profiles:
             # 「人物1=松井」: 既存プロファイルのリネーム
             self.profiles[name] = self.profiles.pop(label)
@@ -234,6 +259,18 @@ class VoiceProfiles:
         self._persist()
         return old
 
+    def remap(self, src: str, dst: str) -> bool:
+        """「fix 人物2=人物1」: srcをdstに統合（srcのプロファイルも削除し、復活を防ぐ）."""
+        with self._lock:
+            if src == dst:
+                return False
+            self.profiles.pop(src, None)   # 残すと同じ声が再びsrcと判定されて復活してしまう
+            for k, v in list(self.sp_map.items()):
+                if v == src:
+                    self.sp_map[k] = dst
+            self._persist()
+            return True
+
     def _persist(self):
         named = {k: v.tolist() for k, v in self.profiles.items() if not self.ANON.match(k)}
         tmp = self.path + ".tmp"
@@ -246,6 +283,11 @@ class VoiceProfiles:
         if self.embed_ms:
             a = np.array(self.embed_ms)
             parts.append(f"声紋計算 {len(a)}回 平均{a.mean():.0f}ms 最大{a.max():.0f}ms")
+        if len(self.same_sims) >= 8 and len(self.diff_sims) >= 12:
+            th, dd, _ = self._calibrated()
+            parts.append(f"部屋の声紋分布: 同一人物{np.median(self.same_sims):.2f}"
+                         f"/別人{np.median(self.diff_sims):.2f}"
+                         f" → しきい値 即時{th:.2f}/合流{dd:.2f}")
         if self.counts:
             order = ["声紋一致", "補正", "自動登録", "蓄積中", "相槌追従",
                      "重なりスキップ", "声紋計算不可"]
@@ -340,12 +382,21 @@ def main():
             colors[key] = PALETTE[len(colors) % len(PALETTE)]
         return colors[key]
 
+    def rekey(old: str, new: str):
+        """表示キーの付け替え: recordsと色を一括移行（話者一覧に旧キーの幽霊を残さない）."""
+        with state_lock:
+            for r in records:
+                if r["speaker"] == old:
+                    r["speaker"] = new
+            if old in colors:
+                colors.setdefault(new, colors.pop(old))
+
     def write_md():
         with state_lock:
             lines = [
                 f"# 議事録 {started.strftime('%Y-%m-%d %H:%M')}",
                 "",
-                f"話者: " + (", ".join(f"{disp_name(s)}" for s in sorted(colors)) or "（未検出）"),
+                "話者: " + (", ".join(disp_name(s) for s in sorted(colors)) or "（未検出）"),
                 "",
             ]
             for r in records:
@@ -427,9 +478,12 @@ def main():
 
     # --- 実行中コマンド ---
     def key_of(tok: str) -> str:
-        """コマンド引数を表示キーへ: 登録名ならそのまま、それ以外は未登録ラベル扱い."""
-        if tracker is not None and tok in tracker.profiles:
-            return tok
+        """コマンド引数を表示キーへ: 人物名はそのまま、数字はそのラベルの現在の表示先."""
+        if tracker is not None:
+            if tok in tracker.profiles:
+                return tok
+            if tok in tracker.sp_map:
+                return tracker.sp_map[tok]
         return "#" + tok
 
     def stdin_commands():
@@ -442,14 +496,9 @@ def main():
             m = re.match(r"^\s*(\S+?)\s*=\s*(.+?)\s*$", line)
             if mfix:
                 src, dst = key_of(mfix.group(1)), key_of(mfix.group(2))
-                with state_lock:
-                    for r in records:
-                        if r["speaker"] == src:
-                            r["speaker"] = dst
-                    if tracker is not None:
-                        for k, v in list(tracker.sp_map.items()):
-                            if v == src:
-                                tracker.sp_map[k] = dst
+                if tracker is not None:
+                    tracker.remap(src, dst)
+                rekey(src, dst)
                 save()
                 print_line(f"# {disp_name(src)} を {disp_name(dst)} に統合しました（過去の発言も修正済み）")
             elif m:
@@ -459,10 +508,7 @@ def main():
                     if old is None:
                         print_line(f"# 話者{label}の音声がまだ足りません（1秒以上話してから再実行）")
                         continue
-                    with state_lock:
-                        for r in records:
-                            if r["speaker"] == old:
-                                r["speaker"] = name
+                    rekey(old, name)
                     save()
                     print_line(f"# {name} の声を登録しました（過去の発言も置換、次回の会議から自動表示）")
                 else:
@@ -471,7 +517,7 @@ def main():
                     save()
                     print_line(f"# 話者{label} → {name}（過去の発言も置換済み）")
             elif line.strip():
-                print_line("# コマンド: 「1=松井」(声を登録) / 「fix 3=1」(表示の統合) / Ctrl+Cで終了")
+                print_line("# コマンド: 「1=松井」(声を登録) / 「fix 2=1」「fix 人物2=人物1」(統合) / Ctrl+Cで終了")
 
     print("# Sonioxに接続中…", flush=True)
     with connect(WS_URL) as ws:
@@ -529,11 +575,7 @@ def main():
                                    f"（類似{d['sim']:.2f}、放置なら{disp_name(d['prev'])}になっていた）")
                     elif d and d["kind"] == "自動登録":
                         if d["rename"]:   # 「#ラベル→人物」の昇格のみ遡及置換（人物キーは不変）
-                            old_key, new_key = d["rename"]
-                            with state_lock:
-                                for r in records:
-                                    if r["speaker"] == old_key:
-                                        r["speaker"] = new_key
+                            rekey(*d["rename"])
                         print_line(f"# この声を「{d['name']}」として追跡します"
                                    f"（実名にするには {d['label']}=名前 と入力）")
                     elif args.vp_debug and d:
@@ -544,9 +586,9 @@ def main():
                 if cur_ms is not None and cur_end is not None:
                     recent_segs.append((cur_ms, cur_end, label))
                     del recent_segs[:-12]
-                with state_lock:
+                with state_lock:   # colorsの変更も保存処理との競合を避けるためロック内で
                     records.append({"ms": cur_ms, "speaker": sp_id, "text": cur_text.strip()})
-                c = color_of(sp_id)
+                    c = color_of(sp_id)
                 print_line(f"{c}[{fmt_ts(cur_ms)}] {disp_name(sp_id)}{RESET}: {cur_text.strip()}")
                 save()
             cur_text = ""
