@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--wav", default=None, help="指定で実マイクの代わりにファイル擬似ライブ")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None, help="保存先mdファイル（省略時 transcripts/日時.md）")
+    ap.add_argument("--no-open", action="store_true", help="ブラウザを自動で開かない")
     args = ap.parse_args()
 
     api_key = os.environ.get("SONIOX_API_KEY")
@@ -243,6 +244,9 @@ def main():
         print("# 開始。話してください（「1=松井」で話者名設定 / Ctrl+Cで終了）", flush=True)
         print(f"# 保存先: {out_path}", flush=True)
         print(f"# ブラウザ表示: open {html_path}（ライブ中は2秒ごと自動更新）\n", flush=True)
+        if not args.no_open:
+            import webbrowser
+            webbrowser.open("file://" + os.path.abspath(html_path))
 
         cur_speaker = None
         cur_text = ""

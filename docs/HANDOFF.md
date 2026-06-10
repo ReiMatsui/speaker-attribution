@@ -28,10 +28,11 @@
     ② 実行中に「1=松井」と打つと話者1を実名化（過去の発言も遡って置換）
     ③ 話者ごと色分けライブ表示、確定前テキストは薄く表示、`[MM:SS]` タイムスタンプ付き
     ④ HTML版も同時保存。`open transcripts/～.html` でブラウザ表示（ライブ中2秒ごと自動更新）
-- 旧実装は `archive/offshelf/` に退避（2026-06-10）: `live_mic.py`（ローカルmlx-whisper, 不安定）,
-  `live_mic_deepgram.py`（Deepgram代替, 日本語＋話者分離, 無料$200枠）,
-  `meeting_server.py`（複数iPhone→Mac, HTTPS版）, run_*/make_*/transcribe_meeting_* と生成音声データ。
-  研究コード `src/spkattr/` と `scripts/`、AMIデータ `offshelf/ami_raw/` は現役のまま。
+- 旧実装は削除済み（2026-06-10, git履歴には残る）: live_mic（ローカルmlx-whisper, 不安定）,
+  live_mic_deepgram（Deepgram代替, 日本語＋話者分離）, meeting_server（複数iPhone→Mac）,
+  run_*/make_*/transcribe_meeting_*, 生成音声・HTMLレポート類。必要なら git 履歴から復元。
+  研究コード `src/spkattr/` と `scripts/`、AMIデータ `offshelf/ami_raw/` は現役のまま
+  （`samples/` は削除したが `uv run python scripts/fetch_samples.py` で再取得可）。
 
 ## 次にやること（おすすめ順）
 1. ~~`live_soniox.py` を"使える議事録ツール"に仕上げる~~ → **実装済み（2026-06-10）**。
