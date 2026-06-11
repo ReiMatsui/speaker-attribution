@@ -185,7 +185,12 @@ def _group_tokens(tokens: list[dict]) -> list[tuple]:
 
 
 def _map_speakers(utts: list[tuple], pcm: bytes, tracker) -> dict:
-    """async話者ID → 表示キー。各話者の長い発話の声紋平均をプロファイルと照合."""
+    """async話者ID → 表示キー（人物との1対1割当）.
+
+    各async話者の長い発話の声紋平均をプロファイルと照合し、類似の高いペアから
+    貪欲に1対1で割り当てる。1対1にしないと、同一再生チェーン等で複数のasync話者が
+    同じ人物に畳まれ、清書の話者数がライブより減る事故が起きる（2026-06-12実測）。
+    """
     mapping = {}
     if tracker is None:
         return mapping
@@ -194,7 +199,7 @@ def _map_speakers(utts: list[tuple], pcm: bytes, tracker) -> dict:
         if s is None or e is None or spk is None:
             continue
         by_spk.setdefault(str(spk), []).append((e - s, s, e))
-    dd = tracker.dedupe
+    pairs = []   # (sim, async話者, 人物)
     for spk, segs in by_spk.items():
         segs = [x for x in sorted(segs, reverse=True) if x[0] >= 1200][:6]
         embs = []
@@ -206,10 +211,17 @@ def _map_speakers(utts: list[tuple], pcm: bytes, tracker) -> dict:
         if embs:
             prof = np.mean(embs, axis=0)
             prof = prof / np.linalg.norm(prof)
-            best = max(((float(np.dot(v, prof)), n)
-                        for n, v in tracker.profiles.items()), default=(-1.0, None))
-            if best[1] is not None and best[0] >= dd:
-                mapping[spk] = best[1]
+            for n, v in tracker.profiles.items():
+                sim = float(np.dot(v, prof))
+                if sim >= tracker.dedupe:
+                    pairs.append((sim, spk, n))
+    used_spk, used_person = set(), set()
+    for sim, spk, n in sorted(pairs, reverse=True):
+        if spk in used_spk or n in used_person:
+            continue
+        mapping[spk] = n
+        used_spk.add(spk)
+        used_person.add(n)
     return mapping
 
 
@@ -963,6 +975,15 @@ def main():
             if tracker is not None:
                 print_line(f"# レイテンシ統計: {tracker.stats()}")
             print_line(f"# 議事録を保存しました: {out_path} / {html_path}")
+            if len(pcm_buf) > SR * 2 * 10:
+                # 録音を保存（清書の再実験・診断用。*.wavはgitignore済み）
+                wav_path = os.path.splitext(out_path)[0] + ".wav"
+                try:
+                    with open(wav_path, "wb") as f:
+                        f.write(_wav_bytes(bytes(pcm_buf)))
+                    print_line(f"# 録音を保存しました: {wav_path}")
+                except OSError as e:
+                    print_line(f"# 録音保存に失敗: {e}")
             # 清書: RT分離は高速応酬で崩れる(実測)ため、全文脈の非同期再処理で最終版を作る
             if not args.no_polish and not api_key and len(pcm_buf) > SR * 2 * 10:
                 print_line("# 清書はスキップ（SONIOX_API_KEY未設定。清書はSoniox非同期APIを使用）")
