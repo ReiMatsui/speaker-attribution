@@ -17,3 +17,5 @@ samples/
 
 transcripts/
 voices.json
+
+.env

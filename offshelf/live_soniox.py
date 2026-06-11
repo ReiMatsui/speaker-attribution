@@ -45,6 +45,42 @@ import numpy as np
 
 SR = 16000
 WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
+SM_WS_URL = "wss://eu.rt.speechmatics.com/v2/"
+
+
+def sm_to_res(msg: dict, lang: str = "ja") -> dict:
+    """SpeechmaticsのRTメッセージをSoniox互換のトークン列に翻訳する.
+
+    供給源を差し替えるだけで、声紋層・表示・保存・清書は無変更で動く。
+    話者ラベル: S1→"1"(表示は話者1)、不明UUはそのまま。
+    """
+    m = msg.get("message")
+    if m == "Error":
+        return {"error_code": msg.get("type"), "error_message": msg.get("reason")}
+    if m == "EndOfTranscript":
+        return {"finished": True, "tokens": []}
+    if m == "EndOfUtterance":
+        return {"tokens": [{"text": "<end>", "is_final": True}]}
+    if m in ("AddTranscript", "AddPartialTranscript"):
+        final = m == "AddTranscript"
+        toks = []
+        for r in msg.get("results", []):
+            alts = r.get("alternatives") or []
+            content = alts[0].get("content", "") if alts else ""
+            if not content:
+                continue
+            spk = (alts[0].get("speaker") or "UU")
+            if spk.startswith("S") and spk[1:].isdigit():
+                spk = spk[1:]
+            if (lang not in ("ja", "zh", "cmn", "yue") and toks
+                    and r.get("type") == "word"):
+                content = " " + content   # 分かち書き言語は語間スペースを補う
+            toks.append({"text": content, "speaker": spk,
+                         "start_ms": int(r["start_time"] * 1000),
+                         "end_ms": int(r["end_time"] * 1000),
+                         "is_final": final})
+        return {"tokens": toks}
+    return {"tokens": []}   # RecognitionStarted / AudioAdded / Info / Warning 等は無視
 
 RESET = "\x1b[0m"
 DIM = "\x1b[2m"
@@ -74,6 +110,23 @@ h1 {{ font-size: 1.2rem; }} .meta {{ color: #6b7280; font-size: .85rem; }}
 <script>window.scrollTo(0, document.body.scrollHeight);</script>
 </body></html>
 """
+
+
+def load_env(path: str = ".env") -> None:
+    """プロジェクト直下の .env からAPIキー等を読み込む（既に設定済みの環境変数を優先）.
+
+    形式: KEY=VALUE の行（#始まりはコメント）。依存なしの最小実装。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
 
 
 def fmt_ts(ms: int | None) -> str:
@@ -496,10 +549,19 @@ def main():
     ap.add_argument("--vp-debug", action="store_true", help="発話ごとの声紋判定の内訳を表示")
     ap.add_argument("--no-polish", action="store_true",
                     help="終了時の清書（非同期APIでの全体再処理）を行わない")
+    ap.add_argument("--stt", default="soniox", choices=["soniox", "speechmatics"],
+                    help="リアルタイムSTTの供給源。speechmaticsは要 SPEECHMATICS_API_KEY"
+                         "（話者分離の評判が良い代替。声紋層など他の機能は不変）")
     args = ap.parse_args()
 
+    load_env()   # .env からAPIキーを読み込み（export済みの値が優先）
     api_key = os.environ.get("SONIOX_API_KEY")
-    if not api_key:
+    sm_key = os.environ.get("SPEECHMATICS_API_KEY")
+    if args.stt == "speechmatics":
+        if not sm_key:
+            raise SystemExit("環境変数 SPEECHMATICS_API_KEY を設定してください"
+                             "（https://portal.speechmatics.com/settings/api-keys）")
+    elif not api_key:
         raise SystemExit("環境変数 SONIOX_API_KEY を設定してください（https://console.soniox.com）")
 
     try:
@@ -507,16 +569,34 @@ def main():
     except ImportError:
         raise SystemExit("uv add websockets を実行してください")
 
-    config = {
-        "api_key": api_key,
-        "model": args.model,
-        "language_hints": [args.lang],
-        "enable_speaker_diarization": True,
-        "enable_endpoint_detection": True,
-        "audio_format": "pcm_s16le",
-        "sample_rate": SR,
-        "num_channels": 1,
-    }
+    if args.stt == "speechmatics":
+        ws_url = SM_WS_URL
+        ws_headers = {"Authorization": f"Bearer {sm_key}"}
+        start_msg = {
+            "message": "StartRecognition",
+            "audio_format": {"type": "raw", "encoding": "pcm_s16le", "sample_rate": SR},
+            "transcription_config": {
+                "language": args.lang,
+                "operating_point": "enhanced",
+                "diarization": "speaker",
+                "enable_partials": True,
+                "max_delay": 1.2,
+                "conversation_config": {"end_of_utterance_silence_trigger": 0.8},
+            },
+        }
+    else:
+        ws_url = WS_URL
+        ws_headers = None
+        start_msg = {
+            "api_key": api_key,
+            "model": args.model,
+            "language_hints": [args.lang],
+            "enable_speaker_diarization": True,
+            "enable_endpoint_detection": True,
+            "audio_format": "pcm_s16le",
+            "sample_rate": SR,
+            "num_channels": 1,
+        }
 
     started = datetime.datetime.now()
     if args.out:
@@ -742,21 +822,26 @@ def main():
             elif line.strip():
                 print_line("# コマンド: 「1=松井」(声を登録) / 「fix 2=1」「fix 人物2=人物1」(統合) / Ctrl+Cで終了")
 
-    print("# Sonioxに接続中…", flush=True)
-    with connect(WS_URL) as ws:
-        ws.send(json.dumps(config))
+    print(f"# {args.stt} に接続中…", flush=True)
+    with connect(ws_url, additional_headers=ws_headers) as ws:
+        ws.send(json.dumps(start_msg))
         threading.Thread(target=from_wav if args.wav else from_mic, daemon=True).start()
         threading.Thread(target=stdin_commands, daemon=True).start()
 
         def sender():
+            seq = 0
             while True:
                 pcm = audio_q.get()
-                if pcm is None:
-                    ws.send("")   # 終端
+                if pcm is None:   # 終端
+                    if args.stt == "speechmatics":
+                        ws.send(json.dumps({"message": "EndOfStream", "last_seq_no": seq}))
+                    else:
+                        ws.send("")
                     break
                 with buf_lock:
-                    pcm_buf.extend(pcm)   # Sonioxの時刻軸と完全一致する位置で蓄積
+                    pcm_buf.extend(pcm)   # STTの時刻軸と完全一致する位置で蓄積
                 ws.send(pcm)
+                seq += 1
         threading.Thread(target=sender, daemon=True).start()
 
         save()
@@ -837,6 +922,8 @@ def main():
         try:
             while True:
                 res = json.loads(ws.recv())
+                if args.stt == "speechmatics":
+                    res = sm_to_res(res, args.lang)
                 if res.get("error_code") is not None:
                     print_line(f"# エラー: {res['error_code']} - {res.get('error_message')}")
                     break
@@ -877,7 +964,9 @@ def main():
                 print_line(f"# レイテンシ統計: {tracker.stats()}")
             print_line(f"# 議事録を保存しました: {out_path} / {html_path}")
             # 清書: RT分離は高速応酬で崩れる(実測)ため、全文脈の非同期再処理で最終版を作る
-            if not args.no_polish and len(pcm_buf) > SR * 2 * 10:
+            if not args.no_polish and not api_key and len(pcm_buf) > SR * 2 * 10:
+                print_line("# 清書はスキップ（SONIOX_API_KEY未設定。清書はSoniox非同期APIを使用）")
+            if not args.no_polish and api_key and len(pcm_buf) > SR * 2 * 10:
                 try:
                     recs = polish(api_key, bytes(pcm_buf), args.lang, tracker, log=print_line)
                     fmd = os.path.splitext(out_path)[0] + ".final.md"

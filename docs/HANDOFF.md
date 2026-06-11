@@ -116,6 +116,16 @@
        しきい値は2層に: モデル別既定値 → 人物別(即時判定のみ)。
        resemblyzerのdedupe既定を0.78→0.72に修正(実測分布: プロファイル本人5%点0.66に対し
        0.78は本人合流まで弾く過剰値だった)。
+    ⑤-l Speechmatics対応(2026-06-12、--stt speechmatics):
+       話者分離に定評のある代替STT。RT WebSocket(wss://eu.rt.speechmatics.com/v2/、
+       Authorization: Bearer SPEECHMATICS_API_KEY)に StartRecognition
+       (language=ja, diarization=speaker, enable_partials, max_delay=1.2,
+        end_of_utterance_silence_trigger=0.8, operating_point=enhanced)。
+       sm_to_res() がAddTranscript/Partial/EndOfUtterance/ErrorをSoniox互換トークンへ翻訳
+       するだけで、声紋層・表示・保存・診断ログは無変更で動く。話者ラベルS1→話者1表示。
+       清書は引き続きSoniox非同期API(SONIOX_API_KEY無しならスキップ)。
+       調整ノブ: Speechmaticsはspeaker_sensitivity/prefer_current_speaker/max_speakersを
+       StartRecognitionで指定可能(未使用、必要になったら追加)。
     ⑤ 声紋プロファイル方式の話者特定（2026-06-10、オンラインクラスタリングから再設計）:
        「1=松井」で話者1の直近声紋(Resemblyzer)を voices.json に登録。以降と次回以降の会議は
        声の照合だけで自動的に実名表示。未登録の声はSonioxラベル(話者N)のまま。
