@@ -80,6 +80,125 @@ def fmt_ts(ms: int | None) -> str:
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+# ---------- 清書（会議後の非同期再処理） ----------
+# RTの話者分離は速い応酬で崩れる(実測: 高速応酬区間で1ラベルに併合)。非同期APIは
+# 全文脈を見られるため分離精度が大幅に高い(公式)。終了時に録音全体を再処理し、
+# async話者を声紋プロファイルで実名に対応づけて「清書版」議事録を作る。
+
+API_BASE = "https://api.soniox.com"
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    import struct
+    n = len(pcm)
+    return (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 1, SR, SR * 2, 2, 16) +
+            b"data" + struct.pack("<I", n) + pcm)
+
+
+def _api(api_key: str, method: str, path: str, body=None, ctype=None, timeout=120):
+    import urllib.request
+    req = urllib.request.Request(API_BASE + path, data=body, method=method)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    if ctype:
+        req.add_header("Content-Type", ctype)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else None
+
+
+def _group_tokens(tokens: list[dict]) -> list[tuple]:
+    """async結果のトークン列を (start_ms, end_ms, 話者, テキスト) の発話列へ."""
+    utts = []
+    cur = None   # [start, end, spk, text]
+    for tk in tokens:
+        text = tk.get("text") or ""
+        if not text or text == "<end>":
+            continue
+        spk = tk.get("speaker")
+        if cur is None or spk != cur[2]:
+            if cur and cur[3].strip():
+                utts.append(tuple(cur))
+            cur = [tk.get("start_ms"), tk.get("end_ms"), spk, ""]
+        if tk.get("end_ms") is not None:
+            cur[1] = tk["end_ms"]
+        cur[3] += text
+    if cur and cur[3].strip():
+        utts.append(tuple(cur))
+    return utts
+
+
+def _map_speakers(utts: list[tuple], pcm: bytes, tracker) -> dict:
+    """async話者ID → 表示キー。各話者の長い発話の声紋平均をプロファイルと照合."""
+    mapping = {}
+    if tracker is None:
+        return mapping
+    by_spk: dict = {}
+    for s, e, spk, _ in utts:
+        if s is None or e is None or spk is None:
+            continue
+        by_spk.setdefault(str(spk), []).append((e - s, s, e))
+    dd = tracker._calibrated()[1]
+    for spk, segs in by_spk.items():
+        segs = [x for x in sorted(segs, reverse=True) if x[0] >= 1200][:6]
+        embs = []
+        for _, s, e in segs:
+            wav = np.frombuffer(pcm[s * 32: e * 32], dtype="<i2").astype(np.float32) / 32768.0
+            emb = tracker._embed(wav)
+            if emb is not None:
+                embs.append(emb)
+        if embs:
+            prof = np.mean(embs, axis=0)
+            prof = prof / np.linalg.norm(prof)
+            best = max(((max(float(np.dot(p, prof)) for p in [v]), n)
+                        for n, v in tracker.profiles.items()), default=(-1.0, None))
+            if best[1] is not None and best[0] >= tracker._person_th(best[1], dd):
+                mapping[spk] = best[1]
+    return mapping
+
+
+def polish(api_key: str, pcm: bytes, lang: str, tracker, log=print) -> list[dict]:
+    """録音全体を非同期APIで再処理し、清書版のrecordsを返す."""
+    log("# 清書: 音声をアップロード中…")
+    import uuid
+    b = "----spkattr" + uuid.uuid4().hex
+    body = ((f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; "
+             f"filename=\"meeting.wav\"\r\nContent-Type: audio/wav\r\n\r\n").encode()
+            + _wav_bytes(pcm) + f"\r\n--{b}--\r\n".encode())
+    file_id = _api(api_key, "POST", "/v1/files", body,
+                   f"multipart/form-data; boundary={b}", timeout=600)["id"]
+    tid = None
+    try:
+        cfg = {"model": "stt-async-v4", "language_hints": [lang],
+               "enable_speaker_diarization": True, "file_id": file_id}
+        tid = _api(api_key, "POST", "/v1/transcriptions",
+                   json.dumps(cfg).encode(), "application/json")["id"]
+        log("# 清書: 再処理を待っています…")
+        t0 = time.time()
+        while True:
+            st = _api(api_key, "GET", f"/v1/transcriptions/{tid}")
+            if st["status"] == "completed":
+                break
+            if st["status"] == "error":
+                raise RuntimeError(st.get("error_message", "unknown"))
+            if time.time() - t0 > 600:
+                raise TimeoutError("非同期処理が10分以内に完了しませんでした")
+            time.sleep(2)
+        tokens = _api(api_key, "GET", f"/v1/transcriptions/{tid}/transcript")["tokens"]
+    finally:   # 後始末（失敗しても続行）
+        try:
+            if tid:
+                _api(api_key, "DELETE", f"/v1/transcriptions/{tid}")
+            _api(api_key, "DELETE", f"/v1/files/{file_id}")
+        except Exception:
+            pass
+    utts = _group_tokens(tokens)
+    log(f"# 清書: {len(utts)}発話を取得、話者を声紋で照合中…")
+    mapping = _map_speakers(utts, pcm, tracker)
+    return [{"ms": s, "speaker": mapping.get(str(spk), "#" + str(spk)), "text": tx.strip()}
+            for s, e, spk, tx in utts]
+
+
 class VoiceProfiles:
     """凍結プロファイル照合による話者特定（台帳固定・誤り非伝播）.
 
@@ -153,6 +272,11 @@ class VoiceProfiles:
         # 全体に上振れして固定しきい値が破綻するため。校正は厳しくする方向にのみ働く(max)。
         self.same_sims: list[float] = []
         self.diff_sims: list[float] = []
+        # 人物別しきい値: 「その人物が普段一致するスコアの典型範囲」を下回る一致は弾く
+        # （新規性検出）。同一再生チェーン等で別人が0.5前後の中途半端な類似を出しても、
+        # 本人の典型(例:0.7台)に届かなければ巻き取らない。診断ログ解析(2026-06-11)で
+        # 吸収帯0.45-0.59と本人帯0.67-0.82の分離を確認、検証で吸収率91%→0%。
+        self.own_sims: dict[str, list[float]] = {}   # 人物 -> 受理された一致simの履歴
         self.embed_ms: list[float] = []                     # レイテンシ統計
         self.counts: dict[str, int] = {}                    # 判定種別の集計
         self.last: dict | None = None                       # 直近の判定内容（可視化用）
@@ -179,6 +303,13 @@ class VoiceProfiles:
                 return (max(self.thresh, mid + 0.4 * (om - mid)),
                         max(self.dedupe, mid), max(self.consist, mid))
         return self.thresh, self.dedupe, self.consist
+
+    def _person_th(self, name: str, base: float) -> float:
+        """人物別しきい値 = max(基準値, その人物の一致sim中央値 - 0.12)."""
+        h = self.own_sims.get(name, [])
+        if len(h) >= 3:
+            return max(base, float(np.median(h)) - 0.12)
+        return base
 
     def _embed(self, wav: np.ndarray) -> np.ndarray | None:
         t0 = time.perf_counter()
@@ -224,10 +355,13 @@ class VoiceProfiles:
                     sim, cand = ranked[0]
                     second = ranked[1][0] if len(ranked) > 1 else -1.0
                     info.update(sim=round(sim, 3), second=round(second, 3), name=cand, prev=prev)
-                    if sim >= th and sim - second >= self.margin:
+                    if sim >= self._person_th(cand, th) and sim - second >= self.margin:
                         # 注: ここでbufは消さない。たまたま強一致した発話でバッファを
                         # リセットすると、新しい話者の3発話が永遠に貯まらない(検証で確認)。
                         self.sp_map[sp] = cand
+                        h = self.own_sims.setdefault(cand, [])
+                        h.append(sim)
+                        del h[:-20]
                         self._note("補正" if (prev is not None and not prev.startswith("#")
                                               and prev != cand) else "声紋一致", label=sp, **info)
                         return cand
@@ -242,7 +376,7 @@ class VoiceProfiles:
                         prof = prof / np.linalg.norm(prof)
                         hit_sim, hit = max(((float(np.dot(p, prof)), n)
                                             for n, p in self.profiles.items()), default=(-1.0, None))
-                        if hit is not None and hit_sim >= dd:
+                        if hit is not None and hit_sim >= self._person_th(hit, dd):
                             target = hit          # 既存人物の別ラベルだった → 合流
                         else:
                             self.n_anon += 1
@@ -292,6 +426,8 @@ class VoiceProfiles:
         for k, v in list(self.sp_map.items()):
             if v == old:
                 self.sp_map[k] = name
+        if old in self.own_sims:
+            self.own_sims[name] = self.own_sims.pop(old)
         if old != label:   # 「人物N=名前」のリネーム以外は、ラベル自体も対応づける
             self.sp_map[label] = name
         self._persist()
@@ -303,6 +439,7 @@ class VoiceProfiles:
             if src == dst:
                 return False
             self.profiles.pop(src, None)   # 残すと同じ声が再びsrcと判定されて復活してしまう
+            self.own_sims.pop(src, None)
             for k, v in list(self.sp_map.items()):
                 if v == src:
                     self.sp_map[k] = dst
@@ -353,6 +490,8 @@ def main():
     ap.add_argument("--vp-no-auto", action="store_true",
                     help="未知の声の自動登録（匿名「人物N」）を無効化")
     ap.add_argument("--vp-debug", action="store_true", help="発話ごとの声紋判定の内訳を表示")
+    ap.add_argument("--no-polish", action="store_true",
+                    help="終了時の清書（非同期APIでの全体再処理）を行わない")
     args = ap.parse_args()
 
     api_key = os.environ.get("SONIOX_API_KEY")
@@ -450,35 +589,40 @@ def main():
         with state_lock:
             records.append({"ms": ms, "sys": text})
 
-    def write_md():
+    def write_md(recs=None, path=None):
         with state_lock:
+            rs = records if recs is None else recs
+            speakers = list(dict.fromkeys(r["speaker"] for r in rs if "speaker" in r))
             lines = [
                 f"# 議事録 {started.strftime('%Y-%m-%d %H:%M')}",
                 "",
-                "話者: " + (", ".join(disp_name(s) for s in sorted(colors)) or "（未検出）"),
+                "話者: " + (", ".join(disp_name(s) for s in speakers) or "（未検出）"),
                 "",
             ]
-            for r in records:
+            for r in rs:
                 if "sys" in r:
                     lines.append(f"> [{fmt_ts(r['ms'])}] {r['sys']}")
                     continue
                 mark = " ⚡" if r.get("vp") == "補正" else ""
                 lines.append(f"- **[{fmt_ts(r['ms'])}] {disp_name(r['speaker'])}{mark}**: {r['text']}")
-            tmp = out_path + ".tmp"
+            dst = path or out_path
+            tmp = dst + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-            os.replace(tmp, out_path)
+            os.replace(tmp, dst)
 
-    def write_html(live: bool = True):
+    def write_html(live: bool = True, recs=None, path=None, status=None):
         import html as _html
         with state_lock:
+            rs = records if recs is None else recs
             parts = []
-            for r in records:
+            for r in rs:
                 if "sys" in r:
                     parts.append(f'<div class="sys">⚙ {_html.escape(r["sys"])}</div>')
                     continue
                 sp = str(r["speaker"])
-                idx = list(colors).index(sp) if sp in colors else 0
+                color_of(sp)
+                idx = list(colors).index(sp)
                 c = HTML_PALETTE[idx % len(HTML_PALETTE)]
                 badge = ""
                 if r.get("vp") == "補正":
@@ -489,17 +633,20 @@ def main():
                     f'<span class="who" style="color:{c}">{_html.escape(disp_name(sp))}</span>'
                     f'{_html.escape(r["text"])}{badge}</div>'
                 )
+            speakers = list(dict.fromkeys(r["speaker"] for r in rs if "speaker" in r))
             doc = HTML_TMPL.format(
                 refresh='<meta http-equiv="refresh" content="2">' if live else "",
                 title=started.strftime("%Y-%m-%d %H:%M"),
-                status='<span class="live">● ライブ（2秒ごと自動更新）</span>' if live else "終了",
-                speakers=_html.escape(", ".join(disp_name(s) for s in sorted(colors)) or "（未検出）"),
+                status=status or ('<span class="live">● ライブ（2秒ごと自動更新）</span>'
+                                  if live else "終了"),
+                speakers=_html.escape(", ".join(disp_name(s) for s in speakers) or "（未検出）"),
                 body="\n".join(parts) or '<p class="meta">（まだ発話なし）</p>',
             )
-            tmp = html_path + ".tmp"
+            dst = path or html_path
+            tmp = dst + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(doc)
-            os.replace(tmp, html_path)
+            os.replace(tmp, dst)
 
     def save(live: bool = True):
         write_md()
@@ -725,6 +872,22 @@ def main():
             if tracker is not None:
                 print_line(f"# レイテンシ統計: {tracker.stats()}")
             print_line(f"# 議事録を保存しました: {out_path} / {html_path}")
+            # 清書: RT分離は高速応酬で崩れる(実測)ため、全文脈の非同期再処理で最終版を作る
+            if not args.no_polish and len(pcm_buf) > SR * 2 * 10:
+                try:
+                    recs = polish(api_key, bytes(pcm_buf), args.lang, tracker, log=print_line)
+                    fmd = os.path.splitext(out_path)[0] + ".final.md"
+                    fht = os.path.splitext(out_path)[0] + ".final.html"
+                    write_md(recs, fmd)
+                    write_html(live=False, recs=recs, path=fht, status="清書（非同期再処理済み）")
+                    print_line(f"# 清書版を保存しました: {fmd} / {fht}")
+                    if not args.no_open:
+                        import webbrowser
+                        webbrowser.open("file://" + os.path.abspath(fht))
+                except KeyboardInterrupt:
+                    print_line("# 清書をスキップしました")
+                except Exception as e:
+                    print_line(f"# 清書に失敗しました: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
