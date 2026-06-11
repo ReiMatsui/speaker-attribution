@@ -61,6 +61,9 @@ h1 {{ font-size: 1.2rem; }} .meta {{ color: #6b7280; font-size: .85rem; }}
 .u .who {{ font-weight: 700; margin-right: .5em; }}
 .u .ts {{ color: #9ca3af; font-size: .8rem; margin-right: .6em; font-variant-numeric: tabular-nums; }}
 .live {{ color: #16a34a; font-size: .8rem; }}
+.badge {{ background: #fef3c7; color: #92400e; font-size: .7rem; border-radius: 6px;
+         padding: .05em .45em; margin-left: .55em; vertical-align: middle; }}
+.sys {{ text-align: center; color: #6b7280; font-size: .78rem; margin: .45rem 0; }}
 </style></head><body>
 <h1>議事録 {title}</h1>
 <p class="meta">{status} / 話者: {speakers}</p>
@@ -91,10 +94,11 @@ class VoiceProfiles:
     ANON = re.compile(r"^人物\d+$")
 
     # モデル別の既定しきい値（実音声プールで校正済み。スコアのスケールが違う）
-    # resemblyzer: 軽量・依存少。同一/別人の分布に重なりあり
-    # ecapa: 純粋な聞き分けはほぼ完全分離＋10倍速。ただし混合音声を成分話者と
-    #        強くマッチさせる癖があり、重なりの多い会議では要実地比較(2026-06-11検証)
-    DEFAULTS = {"resemblyzer": (0.75, 0.70, 0.62), "ecapa": (0.35, 0.28, 0.30)}
+    # resemblyzer: 軽量・依存少。同一/別人の分布に重なりあり（分離マージン-0.06）
+    # ecapa: ほぼ完全分離(+0.01)＋10倍速。混合音声を成分話者と強くマッチさせる癖
+    # redimnet: Interspeech 2024。本プールで最良の分離(+0.10)・27ms級・5M params
+    DEFAULTS = {"resemblyzer": (0.75, 0.70, 0.62), "ecapa": (0.35, 0.28, 0.30),
+                "redimnet": (0.42, 0.30, 0.34)}
 
     def __init__(self, path: str = "voices.json", thresh: float | None = None,
                  min_sec: float = 1.0, margin: float = 0.05, auto: bool = True,
@@ -109,6 +113,16 @@ class VoiceProfiles:
             def _embed_raw(wav):
                 with torch.no_grad():
                     return enc.encode_batch(torch.from_numpy(wav).float().unsqueeze(0)).squeeze().numpy()
+            self._embed_raw = _embed_raw
+        elif model == "redimnet":
+            import torch   # 初回はGitHubからコード＋重み(20MB)をダウンロード
+            enc = torch.hub.load("IDRnD/ReDimNet", "ReDimNet", model_name="b2",
+                                 train_type="ft_lm", dataset="vox2", trust_repo=True)
+            enc.eval()
+
+            def _embed_raw(wav):
+                with torch.no_grad():
+                    return enc(torch.from_numpy(wav).float().unsqueeze(0)).squeeze().numpy()
             self._embed_raw = _embed_raw
         else:
             from resemblyzer import VoiceEncoder, preprocess_wav  # 初回ロード数秒
@@ -329,8 +343,8 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="ブラウザを自動で開かない")
     ap.add_argument("--no-vp", action="store_true", help="声紋照合を無効化（Sonioxのラベルをそのまま使う）")
     ap.add_argument("--voices", default="voices.json", help="声紋プロファイルの保存先(既定 voices.json)")
-    ap.add_argument("--vp-model", default="ecapa", choices=["ecapa", "resemblyzer"],
-                    help="声紋モデル(既定ecapa=聞き分けが強い。要 uv add speechbrain torchaudio。"
+    ap.add_argument("--vp-model", default="ecapa", choices=["ecapa", "redimnet", "resemblyzer"],
+                    help="声紋モデル(既定ecapa。redimnet=2024年世代で実測の分離が最良、実地A/B推奨。"
                          "未導入なら自動でresemblyzerにフォールバック)")
     ap.add_argument("--vp-match", type=float, default=None,
                     help="即時判定のしきい値。省略時はモデル別の既定値(resemblyzer 0.75 / ecapa 0.35)")
@@ -421,10 +435,15 @@ def main():
         """表示キーの付け替え: recordsと色を一括移行（話者一覧に旧キーの幽霊を残さない）."""
         with state_lock:
             for r in records:
-                if r["speaker"] == old:
+                if r.get("speaker") == old:
                     r["speaker"] = new
             if old in colors:
                 colors.setdefault(new, colors.pop(old))
+
+    def add_sys(ms, text: str):
+        """システムイベント（補正・自動登録・命名・統合）を議事録のタイムラインに残す."""
+        with state_lock:
+            records.append({"ms": ms, "sys": text})
 
     def write_md():
         with state_lock:
@@ -435,7 +454,11 @@ def main():
                 "",
             ]
             for r in records:
-                lines.append(f"- **[{fmt_ts(r['ms'])}] {disp_name(r['speaker'])}**: {r['text']}")
+                if "sys" in r:
+                    lines.append(f"> [{fmt_ts(r['ms'])}] {r['sys']}")
+                    continue
+                mark = " ⚡" if r.get("vp") == "補正" else ""
+                lines.append(f"- **[{fmt_ts(r['ms'])}] {disp_name(r['speaker'])}{mark}**: {r['text']}")
             tmp = out_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -446,13 +469,20 @@ def main():
         with state_lock:
             parts = []
             for r in records:
+                if "sys" in r:
+                    parts.append(f'<div class="sys">⚙ {_html.escape(r["sys"])}</div>')
+                    continue
                 sp = str(r["speaker"])
                 idx = list(colors).index(sp) if sp in colors else 0
                 c = HTML_PALETTE[idx % len(HTML_PALETTE)]
+                badge = ""
+                if r.get("vp") == "補正":
+                    note = _html.escape(r.get("note", ""))
+                    badge = f'<span class="badge" title="{note}">⚡声紋補正</span>'
                 parts.append(
                     f'<div class="u"><span class="ts">{fmt_ts(r["ms"])}</span>'
                     f'<span class="who" style="color:{c}">{_html.escape(disp_name(sp))}</span>'
-                    f'{_html.escape(r["text"])}</div>'
+                    f'{_html.escape(r["text"])}{badge}</div>'
                 )
             doc = HTML_TMPL.format(
                 refresh='<meta http-equiv="refresh" content="2">' if live else "",
@@ -534,6 +564,7 @@ def main():
                 if tracker is not None:
                     tracker.remap(src, dst)
                 rekey(src, dst)
+                add_sys(None, f"{disp_name(src)} を {disp_name(dst)} に統合（手動fix）")
                 save()
                 print_line(f"# {disp_name(src)} を {disp_name(dst)} に統合しました（過去の発言も修正済み）")
             elif m:
@@ -544,6 +575,7 @@ def main():
                         print_line(f"# 話者{label}の音声がまだ足りません（1秒以上話してから再実行）")
                         continue
                     rekey(old, name)
+                    add_sys(None, f"「{name}」の声を登録（次回の会議から自動表示）")
                     save()
                     print_line(f"# {name} の声を登録しました（過去の発言も置換、次回の会議から自動表示）")
                 else:
@@ -605,12 +637,17 @@ def main():
                     sp_id = tracker.classify(wav, cur_speaker,
                                              overlapped=overlaps_other(cur_ms, cur_end, label))
                     d = tracker.last
+                    rec_extra = {}
                     if d and d["kind"] == "補正":
-                        print_line(f"# 補正: ラベル{d['label']}の発言を{d['name']}に修正"
-                                   f"（類似{d['sim']:.2f}、放置なら{disp_name(d['prev'])}になっていた）")
+                        note = (f"声紋でラベル{d['label']}の取り違えを修正"
+                                f"（類似{d['sim']:.2f}、放置なら{disp_name(d['prev'])}の発言になっていた）")
+                        rec_extra = {"vp": "補正", "note": note}
+                        print_line(f"# ⚡補正: {note}")
                     elif d and d["kind"] == "自動登録":
                         if d["rename"]:   # 「#ラベル→人物」の昇格のみ遡及置換（人物キーは不変）
                             rekey(*d["rename"])
+                        add_sys(cur_ms, f"この声を「{d['name']}」として追跡開始"
+                                        f"（実名にするには {d['label']}=名前）")
                         print_line(f"# この声を「{d['name']}」として追跡します"
                                    f"（実名にするには {d['label']}=名前 と入力）")
                     elif args.vp_debug and d:
@@ -618,11 +655,13 @@ def main():
                         print_line(f"# vp判定[{d['kind']}]{extra}")
                 else:
                     sp_id = "#" + str(cur_speaker)
+                    rec_extra = {}
                 if cur_ms is not None and cur_end is not None:
                     recent_segs.append((cur_ms, cur_end, label))
                     del recent_segs[:-12]
                 with state_lock:   # colorsの変更も保存処理との競合を避けるためロック内で
-                    records.append({"ms": cur_ms, "speaker": sp_id, "text": cur_text.strip()})
+                    records.append({"ms": cur_ms, "speaker": sp_id, "text": cur_text.strip(),
+                                    **rec_extra})
                     c = color_of(sp_id)
                 print_line(f"{c}[{fmt_ts(cur_ms)}] {disp_name(sp_id)}{RESET}: {cur_text.strip()}")
                 save()
