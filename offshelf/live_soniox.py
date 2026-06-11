@@ -216,12 +216,14 @@ class VoiceProfiles:
                 self.label_embs.setdefault(sp, []).append(emb)
                 del self.label_embs[sp][:-10]    # 手動登録・校正用に直近10発話だけ保持
                 th, dd, cs = self._calibrated()
+                info = {"th": round(th, 3), "dd": round(dd, 3),
+                        "n_prof": len(self.profiles)}   # 診断ログ用
                 if self.profiles:
                     ranked = sorted(((float(np.dot(p, emb)), n)
                                      for n, p in self.profiles.items()), reverse=True)
                     sim, cand = ranked[0]
                     second = ranked[1][0] if len(ranked) > 1 else -1.0
-                    info = {"sim": sim, "name": cand, "prev": prev}
+                    info.update(sim=round(sim, 3), second=round(second, 3), name=cand, prev=prev)
                     if sim >= th and sim - second >= self.margin:
                         # 注: ここでbufは消さない。たまたま強一致した発話でバッファを
                         # リセットすると、新しい話者の3発話が永遠に貯まらない(検証で確認)。
@@ -343,9 +345,9 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="ブラウザを自動で開かない")
     ap.add_argument("--no-vp", action="store_true", help="声紋照合を無効化（Sonioxのラベルをそのまま使う）")
     ap.add_argument("--voices", default="voices.json", help="声紋プロファイルの保存先(既定 voices.json)")
-    ap.add_argument("--vp-model", default="ecapa", choices=["ecapa", "redimnet", "resemblyzer"],
-                    help="声紋モデル(既定ecapa。redimnet=2024年世代で実測の分離が最良、実地A/B推奨。"
-                         "未導入なら自動でresemblyzerにフォールバック)")
+    ap.add_argument("--vp-model", default="redimnet", choices=["redimnet", "ecapa", "resemblyzer"],
+                    help="声紋モデル(既定redimnet=2024年世代、実測の分離・通し精度とも最良。"
+                         "読み込み失敗時は ecapa → resemblyzer へ自動フォールバック)")
     ap.add_argument("--vp-match", type=float, default=None,
                     help="即時判定のしきい値。省略時はモデル別の既定値(resemblyzer 0.75 / ecapa 0.35)")
     ap.add_argument("--vp-no-auto", action="store_true",
@@ -380,6 +382,7 @@ def main():
         os.makedirs("transcripts", exist_ok=True)
         out_path = os.path.join("transcripts", started.strftime("%Y-%m-%d_%H%M") + ".md")
     html_path = os.path.splitext(out_path)[0] + ".html"
+    diag_path = os.path.splitext(out_path)[0] + ".diag.jsonl"   # 発話ごとの判定根拠(劣化解析用)
 
     # --- 状態 ---
     names: dict[str, str] = {}          # 表示キー -> 別名（声紋OFF時の命名用）
@@ -390,16 +393,18 @@ def main():
     tracker: VoiceProfiles | None = None
     if not args.no_vp:
         print("# 声紋モデルを読み込み中…", flush=True)
-        for model in dict.fromkeys([args.vp_model, "resemblyzer"]):   # 指定→ダメならフォールバック
+        for model in dict.fromkeys([args.vp_model, "ecapa", "resemblyzer"]):
             try:
                 tracker = VoiceProfiles(path=args.voices, thresh=args.vp_match,
                                         auto=not args.vp_no_auto, model=model)
                 if model != args.vp_model:
-                    print(f"# 注意: {args.vp_model} の依存が未導入のため {model} で動作します"
-                          f"（uv add speechbrain torchaudio で有効化）", flush=True)
+                    print(f"# 注意: {args.vp_model} を読み込めなかったため {model} で動作します"
+                          f"（依存: uv add speechbrain torchaudio / redimnetは初回ネット接続必要）",
+                          flush=True)
                 print(f"# 声紋モデル: {model}", flush=True)
                 break
-            except ImportError:
+            except Exception as e:   # 依存欠如(ImportError)もDL失敗等も次の候補へ
+                print(f"#   {model}: 読み込み失敗 ({type(e).__name__})", flush=True)
                 continue
         if tracker is None:
             print("# 警告: 声紋照合がOFFです！ 依存が未導入のため人物の確定・補正は行われません。", flush=True)
@@ -659,6 +664,15 @@ def main():
                 if cur_ms is not None and cur_end is not None:
                     recent_segs.append((cur_ms, cur_end, label))
                     del recent_segs[:-12]
+                if tracker is not None and tracker.last is not None:
+                    # 診断ログ: 後から「いつ・なぜ判定が崩れたか」を解析するための1行JSON
+                    try:
+                        with open(diag_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"ms": cur_ms, "end": cur_end, "label": label,
+                                                "key": sp_id, **tracker.last},
+                                               ensure_ascii=False, default=str) + "\n")
+                    except OSError:
+                        pass
                 with state_lock:   # colorsの変更も保存処理との競合を避けるためロック内で
                     records.append({"ms": cur_ms, "speaker": sp_id, "text": cur_text.strip(),
                                     **rec_extra})
