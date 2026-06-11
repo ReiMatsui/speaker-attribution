@@ -126,6 +126,11 @@
        清書は引き続きSoniox非同期API(SONIOX_API_KEY無しならスキップ)。
        調整ノブ: Speechmaticsはspeaker_sensitivity/prefer_current_speaker/max_speakersを
        StartRecognitionで指定可能(未使用、必要になったら追加)。
+       実地A/B(2026-06-12): 音声認識の精度はSonioxが格段に上、話者分離はSpeechmaticsが
+       若干良い、というユーザー体感(業界評判とも一致)。**方針: Sonioxを基本とする**。
+       話者面はテキスト品質より声紋層＋清書でカバーする分業。将来の切り札として
+       「テキスト=Soniox/話者=Speechmaticsのハイブリッド(両API同時接続+時刻合わせ)」を
+       温存(費用2倍・複雑化のためAで不足する場合のみ)。
     ⑤ 声紋プロファイル方式の話者特定（2026-06-10、オンラインクラスタリングから再設計）:
        「1=松井」で話者1の直近声紋(Resemblyzer)を voices.json に登録。以降と次回以降の会議は
        声の照合だけで自動的に実名表示。未登録の声はSonioxラベル(話者N)のまま。
